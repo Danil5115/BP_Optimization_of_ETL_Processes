@@ -1,0 +1,151 @@
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__EXECUTOR}
+  AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__LOAD_EXAMPLES}
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__FERNET_KEY}
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER_SECRET_KEY}
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES__PORT}/airflow
+  AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+  AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+  AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "5"
+  AIRFLOW__SCHEDULER__PROCESSOR_POLL_INTERVAL: "5"
+  AIRFLOW_CONN_DWH_POSTGRES: postgresql+psycopg2://de:${POSTGRES_PASSWORD}@postgres:5432/dwh?application_name=airflow_dwh
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: dwh-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES__PORT}:5432"
+    volumes:
+      - ./dwh/init:/docker-entrypoint-initdb.d
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    build:
+      context: ./airflow
+    image: my-airflow:latest
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+      AIRFLOW_HOME: /opt/airflow
+    command:
+      - bash
+      - -lc
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true &&
+        airflow connections add dwh_postgres \
+          --conn-uri "postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES__PORT}/dwh" || true &&
+        airflow variables set DATA_ROOT "${DATA_ROOT}" &&
+        airflow variables set SPARK_IMAGE "${SPARK_IMAGE}"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - etl_data:${DATA_ROOT}
+      - spark_jobs:/opt/etl/spark/jobs
+
+  airflow-webserver:
+    image: my-airflow:latest
+    container_name: airflow-web
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-env
+      AIRFLOW__WEBSERVER__SHOW_TRIGGER_FORM_IF_NO_PARAMS: "True"
+    user: "${AIRFLOW_UID}:0"
+    ports:
+      - "${AIRFLOW__PORT}:8080"
+    command: ["airflow", "webserver"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - etl_data:${DATA_ROOT}
+      - spark_jobs:/opt/etl/spark/jobs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  airflow-scheduler:
+    image: my-airflow:latest
+    container_name: airflow-scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-env
+    user: "${AIRFLOW_UID}:0"
+    command: ["airflow", "scheduler"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - etl_data:${DATA_ROOT}
+      - spark_jobs:/opt/etl/spark/jobs
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  spark:
+    build:
+      context: ./spark
+    image: ${SPARK_IMAGE}
+    container_name: spark
+    environment:
+      SPARK_MODE: local
+    ports:
+      - "${SPARK_UI__PORT}:4040"
+    volumes:
+      - etl_data:${DATA_ROOT}
+      - spark_jobs:/opt/etl/spark/jobs
+    # Локальный Spark может завершаться (exit 0) — это нормально.
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MB_DB_FILE: /metabase-data/metabase.db        # хранить внутреннюю БД Metabase на volume
+      JAVA_TOOL_OPTIONS: -Xms256m -Xmx1024m
+    ports:
+      - "3000:3000"
+    volumes:
+      - metabase_data:/metabase-data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+
+  etl_data:
+    name: etl_data
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${HOST_DATA_DIR}"
+
+  spark_jobs:
+    name: spark_jobs
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${HOST_SPARK_JOBS_DIR}"
+
+  metabase_data:

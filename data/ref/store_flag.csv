@@ -1,0 +1,4 @@
+store_flag,description
+Y,store and forward trip
+N,not a store and forward trip
+U,Unknown
